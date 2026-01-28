@@ -8,16 +8,8 @@ pag.FAILSAFE = False
 sw, sh = pag.size()
 
 # ================== MediaPipe ==================
-mp_face_mesh = mp.solutions.face_mesh
 mp_hands = mp.solutions.hands
 mp_draw = mp.solutions.drawing_utils
-
-face_mesh = mp_face_mesh.FaceMesh(
-    max_num_faces=1,
-    refine_landmarks=True,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
-)
 
 hands = mp_hands.Hands(
     static_image_mode=False,
@@ -28,22 +20,6 @@ hands = mp_hands.Hands(
 
 cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-
-# ================== Face Indexes ==================
-LEFT_EYE = [33, 160, 158, 133, 153, 144]
-RIGHT_EYE = [362, 385, 387, 263, 373, 380]
-UPPER_LIP = 13
-LOWER_LIP = 14
-NOSE_TIP = 1
-
-STABLE_LANDMARKS = [1, 33, 133, 362, 263, 61, 291, 199, 234, 454]
-
-# ================== Colors ==================
-COLOR_FACE = (120, 120, 120)
-COLOR_STABLE = (0, 0, 255)
-COLOR_EYES = (255, 0, 0)
-COLOR_MOUTH = (0, 255, 255)
 
 # ================== Hand Indexes ==================
 FINGER_TIPS = [4, 8, 12, 16, 20]
@@ -59,18 +35,20 @@ FINGER_CLOSE_THRESH = 0.25
 
 # ================== Debounce ==================
 last_click = 0
-CLICK_DELAY = 0.4
+CLICK_DELAY = 0
 
 last_scroll = 0
 SCROLL_DELAY = 0.15
 
+# ================== Advanced Smoothing ==================
+ema_x, ema_y = sw // 2, sh // 2
+EMA_ALPHA = 0.12        # lower = smoother (0.1–0.2 sweet spot)
 
-# ================== Helpers ==================
-def eye_aspect_ratio(eye, pts):
-    A = euclidean(pts[eye[1]], pts[eye[5]])
-    B = euclidean(pts[eye[2]], pts[eye[4]])
-    C = euclidean(pts[eye[0]], pts[eye[3]])
-    return (A + B) / (2 * C)
+DEADZONE = 8            # pixels (ignore micro jitter)
+
+last_cursor_update = 0
+CURSOR_INTERVAL = 1 / 120   # max 120 updates/sec
+
 
 def euclidean(a, b):
     return np.linalg.norm(np.array(a) - np.array(b))
@@ -98,13 +76,8 @@ def finger_states(hand):
 
 # ================== Cursor Smoothing ==================
 prev_x, prev_y = sw // 2, sh // 2
-SMOOTHING = 0.25
+SMOOTHING = 0.35
 
-# ================== Blink State ==================
-BLINK_THRESHOLD = 0.10
-blink_frames = 0
-
-# ================== Main Loop ==================
 while True:
     ret, frame = cap.read()
     if not ret:
@@ -114,75 +87,32 @@ while True:
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     mesh_canvas = np.zeros_like(frame)
 
-    face_result = face_mesh.process(rgb)
     hand_result = hands.process(rgb)
-
-    # ================== FACE (LOGIC + MESH ONLY) ==================
-    if face_result.multi_face_landmarks:
-        face = face_result.multi_face_landmarks[0]
-        points = []
-
-        for idx, lm in enumerate(face.landmark):
-            x, y = int(lm.x * w), int(lm.y * h)
-            points.append((x, y))
-
-            color, r = COLOR_FACE, 1
-            if idx in STABLE_LANDMARKS:
-                color, r = COLOR_STABLE, 2
-            if idx in LEFT_EYE or idx in RIGHT_EYE:
-                color, r = COLOR_EYES, 2
-            if idx in [UPPER_LIP, LOWER_LIP]:
-                color, r = COLOR_MOUTH, 3
-
-            cv2.circle(mesh_canvas, (x, y), r, color, -1)
-
-        # ---------- Blink Logic ----------
-        ear = (eye_aspect_ratio(LEFT_EYE, points) +
-               eye_aspect_ratio(RIGHT_EYE, points)) / 2
-
-        blink = False
-        if ear < BLINK_THRESHOLD:
-            blink_frames += 1
-        else:
-            if blink_frames >= 2:
-                blink = True
-            blink_frames = 0
-
-        # ---------- Mouth Logic ----------
-        mouth_ratio = euclidean(points[UPPER_LIP], points[LOWER_LIP]) / \
-                      euclidean(points[33], points[263])
-
-        mouth_open = mouth_ratio > 0.20
-        speaking = 0.015 < mouth_ratio < 0.08
-
-        # ---------- Head Direction ----------
-        nx, ny = points[NOSE_TIP]
-        cx, cy = w // 2, h // 2
-
-        if nx < cx - 40:
-            head_dir = "LEFT"
-        elif nx > cx + 40:
-            head_dir = "RIGHT"
-        elif ny < cy - 40:
-            head_dir = "UP"
-        elif ny > cy + 40:
-            head_dir = "DOWN"
-        else:
-            head_dir = "CENTER"
-
-        # ⚠️ All values usable here for actions
-        # blink, mouth_open, speaking, head_dir
 
     # ================== HANDS ==================
     if hand_result.multi_hand_landmarks:
         for hlm, handedness in zip(hand_result.multi_hand_landmarks, hand_result.multi_handedness):
             hand = normalize_hand(hlm.landmark)
 
-            # ---------- Finger close checks ----------
+            # ---------- Finger state checks ----------
+
+            # CLOSED fingers
             ring_closed = np.linalg.norm(hand[15] - hand[13]) < FINGER_CLOSE_THRESH
             pinky_closed = np.linalg.norm(hand[19] - hand[17]) < FINGER_CLOSE_THRESH
 
-            cursor_enabled = ring_closed and pinky_closed
+            # OPEN fingers
+            thumb_open  = np.linalg.norm(hand[4])  > np.linalg.norm(hand[2])
+            index_open  = np.linalg.norm(hand[8])  > np.linalg.norm(hand[5])
+            middle_open = np.linalg.norm(hand[12]) > np.linalg.norm(hand[9])
+
+            # Cursor enable condition
+            cursor_enabled = (
+                ring_closed and
+                pinky_closed and
+                thumb_open and
+                index_open and
+                middle_open
+            )
 
             # ---------- Pinch checks ----------
             index_pinch = np.linalg.norm(hand[4] - hand[8]) < PINCH_THRESH
@@ -200,15 +130,33 @@ while True:
 
             # Cursor control (thumb tip)
             if cursor_enabled:
+                # print("Cursor Enabled")
                 lm = hlm.landmark[4]
                 raw_x = (1 - lm.x) * sw
                 raw_y = lm.y * sh
 
-                cx = int(prev_x + SMOOTHING * (raw_x - prev_x))
-                cy = int(prev_y + SMOOTHING * (raw_y - prev_y))
+                # cx = int(prev_x + SMOOTHING * (raw_x - prev_x))
+                # cy = int(prev_y + SMOOTHING * (raw_y - prev_y))
 
-                pag.moveTo(cx, cy, duration=0)
-                prev_x, prev_y = cx, cy
+                # pag.moveTo(cx, cy, duration=0)
+                # prev_x, prev_y = cx, cy
+
+                now_cursor = time.time()
+
+                if now_cursor - last_cursor_update >= CURSOR_INTERVAL:
+                    # ---------- EMA smoothing ----------
+                    ema_x = ema_x + EMA_ALPHA * (raw_x - ema_x)
+                    ema_y = ema_y + EMA_ALPHA * (raw_y - ema_y)
+
+                    cx, cy = int(ema_x), int(ema_y)
+
+                    # ---------- Deadzone ----------
+                    if abs(cx - prev_x) > DEADZONE or abs(cy - prev_y) > DEADZONE:
+                        pag.moveTo(cx, cy, duration=0)
+                        prev_x, prev_y = cx, cy
+
+                    last_cursor_update = now_cursor
+
 
                 # ---------- CLICK ----------
                 if index_pinch and now - last_click > CLICK_DELAY:
@@ -224,7 +172,7 @@ while True:
     # ================== DISPLAY ==================
     combined = np.hstack((frame, mesh_canvas))
     if __name__ == "__main__":
-        cv2.imshow("Face + Hand Mesh (Logic Active)", combined)
+        cv2.imshow("Hand Mesh (Logic Active)", combined)
 
     if cv2.waitKey(1) & 0xFF == 27:
         break
